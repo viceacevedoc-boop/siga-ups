@@ -1,0 +1,303 @@
+import {RotateCcw} from 'lucide-react';
+import {useEffect, useMemo, useState} from 'react';
+import {CertificatesView} from './components/CertificatesView';
+import {EnrollmentView} from './components/EnrollmentView';
+import {HomeView} from './components/HomeView';
+import {ScheduleView} from './components/ScheduleView';
+import {TopNav} from './components/TopNav';
+import {ValidateCertificateView} from './components/ValidateCertificateView';
+import {STUDENT_PROFILE, TIME_BLOCKS} from './data/mockData';
+import {
+  AcademicState,
+  CertificateRecord,
+  CertificateType,
+  TabId,
+} from './types/academic';
+import {
+  formatSpanishDate,
+  generateSealHash,
+  generateUniqueCertificateCode,
+  loadAcademicState,
+  resetAcademicState,
+  saveAcademicState,
+} from './utils/storage';
+
+export default function App() {
+  const [state, setState] = useState<AcademicState>(() => loadAcademicState());
+  const [activeTab, setActiveTab] = useState<TabId>('inicio');
+  const [justConfirmed, setJustConfirmed] = useState(false);
+  const [validationPreloadCode, setValidationPreloadCode] = useState('');
+  const [confirmResetOpen, setConfirmResetOpen] = useState(false);
+
+  // Persist every state update to localStorage
+  useEffect(() => {
+    saveAcademicState(state);
+  }, [state]);
+
+  // Support direct QR validation link (?validar=SIGA-2026-XXXXXX)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('validar');
+    if (code && code.trim()) {
+      setValidationPreloadCode(code.trim().toUpperCase());
+      setActiveTab('validar');
+    }
+  }, []);
+
+  const confirmedCourses = useMemo(
+    () => state.courses.filter((c) => state.confirmedIds.includes(c.id)),
+    [state.courses, state.confirmedIds]
+  );
+
+  const draftCourses = useMemo(
+    () => state.courses.filter((c) => state.draftSelectedIds.includes(c.id)),
+    [state.courses, state.draftSelectedIds]
+  );
+
+  const handleSelectTab = (tab: TabId) => {
+    if (tab !== 'horario') {
+      setJustConfirmed(false);
+    }
+    if (tab !== 'validar') {
+      setValidationPreloadCode('');
+    }
+    setActiveTab(tab);
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  };
+
+  const handleToggleCourse = (
+    courseId: string
+  ): {ok: boolean; error?: string; message?: string} => {
+    const targetCourse = state.courses.find((c) => c.id === courseId);
+    if (!targetCourse) {
+      return {ok: false, error: 'No se encontró la asignatura seleccionada.'};
+    }
+
+    const alreadySelected = state.draftSelectedIds.includes(courseId);
+
+    if (alreadySelected) {
+      setState((prev) => ({
+        ...prev,
+        courses: prev.courses.map((c) =>
+          c.id === courseId
+            ? {
+                ...c,
+                cuposDisponibles: Math.min(c.cuposTotales, c.cuposDisponibles + 1),
+              }
+            : c
+        ),
+        draftSelectedIds: prev.draftSelectedIds.filter((id) => id !== courseId),
+      }));
+      return {
+        ok: true,
+        message: `Quitaste ${targetCourse.nombre} de tu selección y se liberó 1 cupo.`,
+      };
+    }
+
+    // Check available seats
+    if (targetCourse.cuposDisponibles <= 0) {
+      return {
+        ok: false,
+        error: `No quedan cupos disponibles en ${targetCourse.nombre} (${targetCourse.seccion}).`,
+      };
+    }
+
+    // Check schedule conflict against selected courses
+    const selectedCourses = state.courses.filter((c) =>
+      state.draftSelectedIds.includes(c.id)
+    );
+
+    for (const existing of selectedCourses) {
+      for (const existingBlock of existing.bloques) {
+        const conflict = targetCourse.bloques.find(
+          (b) =>
+            b.dia === existingBlock.dia && b.bloqueId === existingBlock.bloqueId
+        );
+        if (conflict) {
+          const blockDef = TIME_BLOCKS.find((tb) => tb.id === conflict.bloqueId);
+          const timeLabel = blockDef ? blockDef.label : conflict.bloqueId;
+          return {
+            ok: false,
+            error: `Choque de horario: ${targetCourse.nombre} coincide con ${existing.nombre} el ${conflict.dia} (${timeLabel}).`,
+          };
+        }
+      }
+    }
+
+    setState((prev) => ({
+      ...prev,
+      courses: prev.courses.map((c) =>
+        c.id === courseId
+          ? {...c, cuposDisponibles: Math.max(0, c.cuposDisponibles - 1)}
+          : c
+      ),
+      draftSelectedIds: [...prev.draftSelectedIds, courseId],
+    }));
+
+    return {
+      ok: true,
+      message: `Inscribiste ${targetCourse.nombre} en tu selección actual.`,
+    };
+  };
+
+  const handleConfirmEnrollment = (): {ok: boolean; error?: string} => {
+    if (state.draftSelectedIds.length === 0) {
+      return {
+        ok: false,
+        error:
+          'Debes inscribir al menos una asignatura antes de confirmar tu inscripción.',
+      };
+    }
+
+    const nowIso = new Date().toISOString();
+    setState((prev) => ({
+      ...prev,
+      confirmedIds: [...prev.draftSelectedIds],
+      lastConfirmationAt: nowIso,
+    }));
+    setJustConfirmed(true);
+    setActiveTab('horario');
+    window.scrollTo({top: 0, behavior: 'smooth'});
+    return {ok: true};
+  };
+
+  const handleGenerateCertificate = (
+    tipo: CertificateType,
+    motivo: string
+  ): CertificateRecord => {
+    const nowIso = new Date().toISOString();
+    const codigoUnico = generateUniqueCertificateCode(
+      state.certificates.map((c) => c.codigoUnico)
+    );
+    const newRecord: CertificateRecord = {
+      id: `cert-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      codigoUnico,
+      tipo,
+      motivo,
+      estudianteNombre: STUDENT_PROFILE.nombre,
+      estudianteRut: STUDENT_PROFILE.rut,
+      estudianteMatricula: STUDENT_PROFILE.matricula,
+      carrera: STUDENT_PROFILE.carrera,
+      fechaEmisionIso: nowIso,
+      fechaEmisionTexto: formatSpanishDate(nowIso),
+      selloHash: generateSealHash(),
+    };
+
+    setState((prev) => ({
+      ...prev,
+      certificates: [newRecord, ...prev.certificates],
+    }));
+
+    return newRecord;
+  };
+
+  const handleGoToValidateWithCode = (code: string) => {
+    setValidationPreloadCode(code);
+    setActiveTab('validar');
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  };
+
+  const handleResetDemo = () => {
+    const fresh = resetAcademicState();
+    setState(fresh);
+    setJustConfirmed(false);
+    setValidationPreloadCode('');
+    setConfirmResetOpen(false);
+    setActiveTab('inicio');
+  };
+
+  return (
+    <div className="min-h-screen flex flex-col bg-[#F6F7FB] text-[#182144]">
+      <TopNav activeTab={activeTab} onSelectTab={handleSelectTab} />
+
+      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10">
+        {activeTab === 'inicio' && (
+          <HomeView
+            confirmedCourses={confirmedCourses}
+            draftCourses={draftCourses}
+            certificatesCount={state.certificates.length}
+            onNavigate={handleSelectTab}
+          />
+        )}
+
+        {activeTab === 'inscripcion' && (
+          <EnrollmentView
+            courses={state.courses}
+            draftSelectedIds={state.draftSelectedIds}
+            confirmedIds={state.confirmedIds}
+            onToggleCourse={handleToggleCourse}
+            onConfirmEnrollment={handleConfirmEnrollment}
+          />
+        )}
+
+        {activeTab === 'horario' && (
+          <ScheduleView
+            confirmedCourses={confirmedCourses}
+            lastConfirmationAt={state.lastConfirmationAt}
+            justConfirmed={justConfirmed}
+            onDismissJustConfirmed={() => setJustConfirmed(false)}
+            onGoToEnrollment={() => handleSelectTab('inscripcion')}
+          />
+        )}
+
+        {activeTab === 'certificados' && (
+          <CertificatesView
+            certificates={state.certificates}
+            onGenerateCertificate={handleGenerateCertificate}
+            onValidateCode={handleGoToValidateWithCode}
+          />
+        )}
+
+        {activeTab === 'validar' && (
+          <ValidateCertificateView
+            certificates={state.certificates}
+            initialCode={validationPreloadCode}
+            onGoToCertificates={() => handleSelectTab('certificados')}
+          />
+        )}
+      </main>
+
+      <footer className="border-t border-[#E2E6F0] bg-white no-print">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 text-xs text-[#6B7280]">
+          <p>
+            SIGA · Sistema Integrado de Gestión Académica · Universidad Politécnica
+            del Sur
+          </p>
+
+          <div className="flex items-center gap-3">
+            {!confirmResetOpen ? (
+              <button
+                type="button"
+                onClick={() => setConfirmResetOpen(true)}
+                className="inline-flex items-center gap-1.5 text-xs font-medium text-[#4B5563] hover:text-[#2F3E7E] transition-colors py-1"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Restablecer datos de ejemplo</span>
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-[#182144] font-medium">
+                  ¿Reiniciar inscripciones y certificados?
+                </span>
+                <button
+                  type="button"
+                  onClick={handleResetDemo}
+                  className="px-2.5 py-1 rounded-md bg-[#FD6068] text-white font-semibold hover:bg-[#E14851] transition-colors"
+                >
+                  Sí, reiniciar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmResetOpen(false)}
+                  className="px-2.5 py-1 rounded-md bg-[#F1F4FA] text-[#182144] font-semibold hover:bg-[#E5EAF5] transition-colors"
+                >
+                  Cancelar
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}
